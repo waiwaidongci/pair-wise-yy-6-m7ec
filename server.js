@@ -1,8 +1,9 @@
 import http from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createStore } from "./storage.js";
+import { page } from "./page.js";
+import { allowsGrinding, NORMAL, PENDING } from "./inspection.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "ink-stick-testing.json");
@@ -17,12 +18,7 @@ const seed = {
       "storage": "恒湿柜B",
       "status": "已试磨",
       "logs": [
-        {
-          "at": "2026-06-11",
-          "step": "试磨",
-          "note": "宣纸20滴水，出墨快，评分86",
-          "score": 86
-        }
+        { "at": "2026-06-11", "step": "试磨", "note": "宣纸20滴水，出墨快，评分86", "score": 86 }
       ]
     },
     {
@@ -34,21 +30,14 @@ const seed = {
       "status": "待试磨",
       "logs": []
     }
-  ]
+  ],
+  "inspections": []
 };
-const fields = [["code","墨锭编号","text"],["smokeSource","烟料来源","text"],["glueRatio","胶料比例","text"],["ageYears","存放年限","number"],["storage","存放位置","text"]];
-const stages = ["待试磨","已试磨","重点观察"];
-const statLabels = ["待试磨","已试磨","重点观察"];
-const extraFields = [["paper","试磨纸张"],["water","加水量"],["speed","出墨速度"],["colorLayer","墨色层次"],["sediment","沉淀情况"],["score","评分"]];
+const stages = ["待试磨", "已试磨", "重点观察", "已隔离"];
+const statLabels = ["待试磨", "已试磨", "重点观察", "已隔离"];
 
-async function loadDb() {
-  if (!existsSync(dbPath)) {
-    await mkdir(dirname(dbPath), { recursive: true });
-    await writeFile(dbPath, JSON.stringify(seed, null, 2));
-  }
-  return JSON.parse(await readFile(dbPath, "utf8"));
-}
-async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
+const store = createStore(dbPath, seed);
+
 async function body(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -65,146 +54,165 @@ function html(res, text) {
 function newId() { return "IS-" + Date.now(); }
 function computeStats(items) {
   const stats = Object.fromEntries(statLabels.map(label => [label, 0]));
-  for (const item of items) {
-    if (stats[item.status] !== undefined) stats[item.status] += 1;
-  }
+  for (const item of items) if (stats[item.status] !== undefined) stats[item.status] += 1;
   return stats;
 }
-function summarize(item) {
-  const logCount = (item.logs || []).length + (item.tasks || []).reduce((n, t) => n + (t.logs || []).length, 0);
-  return { ...item, logCount };
+function summarize(store, db, item) {
+  const id = item.id || item.code;
+  const logCount = (item.logs || []).length;
+  const active = store.activeFor(db, id);
+  return { ...item, logCount, inspectionStatus: active ? active.status : null, inspectionId: active ? active.id : null };
 }
-function page() {
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>墨锭试磨室</title>
-  <style>
-    :root { --bg:#f1f3ef; --panel:#fff; --ink:#20241f; --muted:#687066; --line:#d4ddd0; --accent:#526f43; --warn:#9b4937; }
-    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font-family:Arial,"PingFang SC",sans-serif; }
-    header { padding:22px 28px; background:#fff; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:16px; align-items:center; }
-    h1 { margin:0; font-size:26px; } h2 { margin:0 0 12px; font-size:18px; } main { display:grid; grid-template-columns:380px 1fr; gap:22px; padding:22px 28px; }
-    form,.panel,.card,.stat { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
-    label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; } input,select,textarea { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; background:#fff; } textarea { min-height:68px; }
-    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:10px 13px; font-weight:700; cursor:pointer; } button.secondary { background:#69736a; }
-    .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:14px; } .stat strong { display:block; font-size:24px; }
-    .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; } .toolbar select,.toolbar input { width:auto; min-width:160px; }
-    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
-    .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
-    .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
-    @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} }
-  </style>
-</head>
-<body>
-  <header><div><h1>墨锭试磨室</h1><div class="meta">墨锭建档、试磨记录和评分统计</div></div><button id="reload">刷新</button></header>
-  <main>
-    <section>
-      <form id="createForm"><h2>新增墨锭</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存墨锭</button></form>
-      <form id="actionForm" style="margin-top:14px"><h2>创建试磨记录</h2><label>选择墨锭</label><select name="id" id="itemSelect"></select><div id="extraFields"></div><button>提交记录</button></form>
-    </section>
-    <section>
-      <div class="stats" id="stats"></div>
-      <div class="toolbar"><select id="statusFilter"><option value="">全部状态</option>${stages.map(s => '<option>'+s+'</option>').join('')}</select><input id="search" placeholder="搜索编号或关键词"></div>
-      <div class="panel"><h2>选择墨锭后录入试磨记录，系统会保留多次试磨结果并更新评分状态。</h2><div class="grid" id="cards"></div></div>
-    </section>
-  </main>
-  <script>
-    const fields = [["code","墨锭编号","text"],["smokeSource","烟料来源","text"],["glueRatio","胶料比例","text"],["ageYears","存放年限","number"],["storage","存放位置","text"]];
-    const stages = ["待试磨","已试磨","重点观察"];
-    const extraFields = [["paper","试磨纸张"],["water","加水量"],["speed","出墨速度"],["colorLayer","墨色层次"],["sediment","沉淀情况"],["score","评分"]];
-    const createForm = document.querySelector('#createForm');
-    const actionForm = document.querySelector('#actionForm');
-    const cards = document.querySelector('#cards');
-    const statsEl = document.querySelector('#stats');
-    const itemSelect = document.querySelector('#itemSelect');
-    let items = [];
-    async function api(path, options) {
-      const res = await fetch(path, options && options.body ? { ...options, headers:{ 'Content-Type':'application/json' } } : options);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '请求失败');
-      return data;
-    }
-    function renderForms() {
-      document.querySelector('#fields').innerHTML = fields.map(([key,label,type]) => '<label>'+label+'</label><input name="'+key+'" type="'+type+'" '+(key==='code'?'required':'')+'>').join('');
-      document.querySelector('#extraFields').innerHTML = extraFields.map(([key,label]) => '<label>'+label+'</label><input name="'+key+'">').join('');
-    }
-    function render() {
-      itemSelect.innerHTML = items.map(item => '<option value="'+(item.id || item.code)+'">'+(item.code || item.id)+' · '+(item.name || item.shipType || item.source || item.plateSize || '')+'</option>').join('');
-      const stats = Object.fromEntries(stages.map(s => [s, items.filter(i => i.status === s).length]));
-      statsEl.innerHTML = Object.entries(stats).map(([k,v]) => '<div class="stat"><span>'+k+'</span><strong>'+v+'</strong></div>').join('');
-      const status = document.querySelector('#statusFilter').value;
-      const q = document.querySelector('#search').value.trim();
-      const visible = items.filter(item => (!status || item.status === status) && (!q || JSON.stringify(item).includes(q)));
-      cards.innerHTML = visible.map(item => cardHtml(item)).join('');
-      document.querySelectorAll('[data-status]').forEach(sel => sel.onchange = async () => { await api('/api/items/'+sel.dataset.status, { method:'PATCH', body: JSON.stringify({ status: sel.value }) }); await load(); });
-      document.querySelectorAll('[data-note]').forEach(btn => btn.onclick = async () => { const id = btn.dataset.note; const note = prompt('记录备注'); if (note) { await api('/api/items/'+id+'/logs', { method:'POST', body: JSON.stringify({ step:'备注', note }) }); await load(); } });
-    }
-    function cardHtml(item) {
-      const main = fields.slice(0,4).map(([key,label]) => '<div><b>'+label+'</b> '+(item[key] ?? '')+'</div>').join('');
-      const tasks = (item.tasks || []).map(t => '<div class="meta">任务 '+t.position+' · '+t.status+' · '+t.tension+'</div>').join('');
-      const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
-      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
-    }
-    async function load() { items = await api('/api/items'); render(); }
-    createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
-    actionForm.onsubmit = async event => { event.preventDefault(); await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); };
-    document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render; document.querySelector('#reload').onclick = load;
-    renderForms(); load();
-  </script>
-</body>
-</html>`;
+// 巡检结论驱动墨锭隔离/恢复状态
+function syncItemStatus(item, form) {
+  if (form) {
+    if (form.status === PENDING) item.status = "已隔离";
+    else if (form.status === NORMAL && item.status === "已隔离") item.status = "待试磨";
+  }
 }
 
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const db = await loadDb();
+    const db = await store.load();
+    const now = new Date();
+
     if (req.method === "GET" && url.pathname === "/") return html(res, page());
-    if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
+
+    if (req.method === "GET" && url.pathname === "/api/items")
+      return send(res, 200, db.items.map(it => summarize(store, db, it)));
+
+    // 建档：同时登记入库环境巡检单，按外观自动判定隔离
     if (req.method === "POST" && url.pathname === "/api/items") {
       const input = await body(req);
-      const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建墨锭" }] };
-      
+      const item = {
+        id: newId(),
+        code: input.code,
+        smokeSource: input.smokeSource,
+        glueRatio: input.glueRatio,
+        ageYears: input.ageYears,
+        storage: input.storage,
+        status: input.status || "待试磨",
+        logs: [{ at: now.toISOString(), step: "建档", note: "创建墨锭" }]
+      };
       db.items.unshift(item);
-      await saveDb(db);
-      return send(res, 201, item);
+      const form = store.createInspection(db, item, input, now);
+      syncItemStatus(item, form);
+      item.logs.push({ at: now.toISOString(), step: "巡检", note: "入库巡检：" + form.status });
+      await store.save(db);
+      return send(res, 201, summarize(store, db, item));
     }
+
     const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
     if (patch && req.method === "PATCH") {
-      const item = db.items.find(x => x.id === patch[1] || x.code === patch[1]);
+      const item = store.findItem(db, patch[1]);
       if (!item) return send(res, 404, { error: "item_not_found" });
-      Object.assign(item, await body(req));
+      const input = await body(req);
+      // 状态可改；库位不允许在普通更新里直接改，必须走移库接口
+      if (input.status && stages.includes(input.status)) item.status = input.status;
       item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
-      await saveDb(db);
+      item.logs.push({ at: now.toISOString(), step: "状态", note: "更新为" + item.status });
+      await store.save(db);
       return send(res, 200, item);
     }
+
+    // 改库位：原巡检结论失效，旧单仍可查，须重新巡检
+    const move = url.pathname.match(/^\/api\/items\/([^/]+)\/move$/);
+    if (move && req.method === "POST") {
+      const item = store.findItem(db, move[1]);
+      if (!item) return send(res, 404, { error: "item_not_found" });
+      const { storage } = await body(req);
+      if (!storage || !String(storage).trim()) return send(res, 400, { error: "缺少新库位" });
+      const old = store.invalidateActive(db, item.id || item.code, "库位变更为「" + storage + "」，原结论失效", now);
+      item.storage = String(storage).trim();
+      item.logs ||= [];
+      item.logs.push({ at: now.toISOString(), step: "移库", note: "库位改为" + item.storage + (old ? "，原巡检单" + old.id + "失效" : "") });
+      await store.save(db);
+      return send(res, 200, summarize(store, db, item));
+    }
+
     const log = url.pathname.match(/^\/api\/items\/([^/]+)\/logs$/);
     if (log && req.method === "POST") {
-      const item = db.items.find(x => x.id === log[1] || x.code === log[1]);
+      const item = store.findItem(db, log[1]);
       if (!item) return send(res, 404, { error: "item_not_found" });
       const input = await body(req);
       item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: input.step || "记录", note: input.note || "" });
-      await saveDb(db);
+      item.logs.push({ at: now.toISOString(), step: input.step || "记录", note: input.note || "" });
+      await store.save(db);
       return send(res, 201, item);
     }
+
+    // 试磨：必须存在“正常”的有效巡检单，否则拒绝（隔离/待复验/未巡检都不能磨）
     const action = url.pathname.match(/^\/api\/items\/([^/]+)\/action$/);
     if (action && req.method === "POST") {
-      const item = db.items.find(x => x.id === action[1] || x.code === action[1]);
+      const item = store.findItem(db, action[1]);
       if (!item) return send(res, 404, { error: "item_not_found" });
+      const active = store.activeFor(db, item.id || item.code);
+      if (!allowsGrinding(active))
+        return send(res, 409, { error: active ? "巡检结论为" + active.status + "，恢复试磨前禁止试磨" : "缺少有效巡检单，禁止试磨" });
       const input = await body(req);
-      item.logs ||= [];
       const score = Number(input.score || 0);
       item.tests ||= [];
-      item.tests.push({ at: new Date().toISOString(), ...input, score });
+      item.tests.push({ at: now.toISOString(), ...input, score });
       item.status = score >= 85 ? "已试磨" : "重点观察";
-      item.logs.push({ at: new Date().toISOString(), step: "试磨", note: (input.paper || "试纸") + "，评分" + score, score });
-      await saveDb(db);
-      return send(res, 201, item);
+      item.logs ||= [];
+      item.logs.push({ at: now.toISOString(), step: "试磨", note: (input.paper || "试纸") + "，评分" + score + "（巡检单" + active.id + "正常）", score });
+      await store.save(db);
+      return send(res, 201, summarize(store, db, item));
     }
+
+    // 巡检单列表，可按 正常/待复验/已失效 筛选
+    if (req.method === "GET" && url.pathname === "/api/inspections") {
+      const status = url.searchParams.get("status") || "";
+      const q = url.searchParams.get("q") || "";
+      return send(res, 200, store.listForms(db, { status, q }));
+    }
+
+    // 补登记一张巡检单（每锭只留一张未复验单，旧的未失效单被替代）
+    if (req.method === "POST" && url.pathname === "/api/inspections") {
+      const input = await body(req);
+      const item = store.findItem(db, input.itemId);
+      if (!item) return send(res, 404, { error: "item_not_found" });
+      if (input.humidity === undefined || !input.appearance || !input.inspector)
+        return send(res, 400, { error: "巡检单须记录温度、湿度、外观和巡检人" });
+      const form = store.createInspection(db, item, { ...input, storage: input.storage ?? item.storage }, now);
+      syncItemStatus(item, form);
+      item.logs ||= [];
+      item.logs.push({ at: now.toISOString(), step: "巡检", note: "环境巡检：" + form.status + "（库位" + form.storage + "）" });
+      await store.save(db);
+      return send(res, 201, form);
+    }
+
+    // 复验：换人，隔12小时两次合格才恢复
+    const recheck = url.pathname.match(/^\/api\/inspections\/([^/]+)\/rechecks$/);
+    if (recheck && req.method === "POST") {
+      const input = await body(req);
+      const result = store.addRecheck(db, recheck[1], input, now);
+      if (result.error) return send(res, 400, { error: result.error });
+      const item = store.findItem(db, result.form.itemId);
+      syncItemStatus(item, result.form);
+      item.logs ||= [];
+      item.logs.push({
+        at: now.toISOString(),
+        step: "复验",
+        note: "复验" + result.form.rechecks.length + "/2，结论" + result.form.status
+      });
+      await store.save(db);
+      return send(res, 201, result.form);
+    }
+
+    // 更正巡检值：旧单失效留痕，另开新单重判
+    const correct = url.pathname.match(/^\/api\/inspections\/([^/]+)\/correct$/);
+    if (correct && req.method === "POST") {
+      const input = await body(req);
+      const result = store.correctInspection(db, correct[1], input, now);
+      if (result.error) return send(res, 400, { error: result.error });
+      const item = store.findItem(db, result.form.itemId);
+      syncItemStatus(item, result.form);
+      await store.save(db);
+      return send(res, 201, { form: result.form, old: result.old });
+    }
+
     if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
     send(res, 404, { error: "not_found" });
   } catch (error) {
